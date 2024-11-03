@@ -16,8 +16,7 @@ from bot.core.registrator import register_sessions
 from .ps import check_base_url
 
 
-start_text = """
-                                BY D4rkCipherX                                                                                                                                                                         
+start_text = """                                                                                                                                                                         
 Select an action:
 
     1. Run clicker (Session)

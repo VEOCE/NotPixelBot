@@ -1,232 +1,109 @@
-from datetime import datetime, timedelta, timezone
-from dateutil import parser
-from time import time
-from urllib.parse import unquote, quote
-import re
-import os
-import math
-from copy import deepcopy
-from PIL import Image
-import io
-import ssl
-import glob
-import cloudscraper
+import asyncio
+import json
+import random
+from itertools import cycle
+from urllib.parse import unquote
 
-from json import dump as dp, loads as ld
+import aiohttp
+import requests
 from aiocfscrape import CloudflareScraper
 from aiohttp_proxy import ProxyConnector
 from better_proxy import Proxy
 from pyrogram import Client
 from pyrogram.errors import Unauthorized, UserDeactivated, AuthKeyUnregistered, FloodWait
+from pyrogram.raw.types import InputBotAppShortName
 from pyrogram.raw.functions.messages import RequestAppWebView
-from pyrogram.raw import types
-
-import websockets
-import asyncio
-import random
-import string
-import brotli
-import base64
-import secrets
-import uuid
-import aiohttp
-import json
-
-# from centrifuge import (Client, CentrifugeError)
-# from .sockets import ClientEventLoggerHandler, SubscriptionEventLoggerHandler
-
-from .agents import generate_random_user_agent
-from .headers import headers, headers_notcoin, headers_socket, headers_image
-from .helper import format_duration
-from .image_checker import get_cords_and_color, template_to_join, inform, boost_record
-
+from bot.core.agents import generate_random_user_agent
 from bot.config import settings
-from bot.utils import logger
-from bot.utils.templates import generate_template_html_page
-from bot.utils.logger import SelfTGClient
-from bot.exceptions import InvalidSession
+from datetime import datetime, timedelta
+from tzlocal import get_localzone
+import time as time_module
 
-self_tg_client = SelfTGClient()
+from bot.core.image_checker import get_cords_and_color, template_to_join, inform, reachable
+from bot.utils import logger
+from bot.exceptions import InvalidSession
+from .headers import headers
+from random import randint, uniform
+import urllib3
+import base64
+import os
+from PIL import Image
+import io
+import traceback
+from bot.utils.ps import check_base_url
+import sys
+import cloudscraper
+
+
+def generate_websocket_key():
+    random_bytes = os.urandom(16)
+    websocket_key = base64.b64encode(random_bytes).decode('utf-8')
+    return websocket_key
+
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+API_GAME_ENDPOINT = "https://notpx.app/api/v1"
+
 
 class Tapper:
-    def __init__(self, tg_client: Client):
-        self.session_name = tg_client.name
+    def __init__(self, tg_client: Client, multi_thread: bool):
         self.tg_client = tg_client
-        self.user_id = 0
-        self.username = None
-        self.first_name = None
-        self.last_name = None
-        self.fullname = None
-        self.start_param = None
-        self.peer = None
-        self.first_run = None
-        self.game_service_is_unavailable = False
-        self.already_joined_squad_channel = None
-        self.user = None
-        self.updated_pixels = {}
+        self.session_name = tg_client.name
+        self.first_name = ''
+        self.last_name = ''
+        self.user_id = ''
+        self.auth_token = ""
+        self.last_claim = None
+        self.last_checkin = None
+        self.balace = 0
+        self.maxtime = 0
+        self.fromstart = 0
+        self.checked = [False] * 9
+        self.balance = 0
+        self.color_list = ["#FFD635", "#7EED56", "#00CCC0", "#51E9F4", "#94B3FF", "#000000", "#898D90", "#E46E6E",
+                           "#E4ABFF", "#FF99AA", "#FFB470", "#FFFFFF", "#BE0039", "#FF9600", "#00CC78", "#009EAA",
+                           "#3690EA", "#6A5CFF", "#B44AC0", "#FF3881", "#9C6926", "#6D001A", "#BF4300", "#00A368",
+                           "#00756F", "#2450A4", "#493AC1", "#811E9F", "#A00357", "#6D482F"]
+        self.multi_thread = multi_thread
+        self.my_ref = "f6624523270"
+        self.clb_ref = "f7385650582"
         self.socket = None
-        self.socket_task = None
-        self.current_user_balance = 0
-        self.template_info = {}
-        self.image_directory = './bot/assets/templates'
-        self.custom_template_id = None
-        self.template_id_to_join = None
-        self.mode = 'CUSTOM TEMPLATE'
-        self.session_ug_dict = self.load_user_agents() or []
-        self.subscription_ready = asyncio.Event()
-        self.image_scraper = None
-        self.image_scraper_proxies = None
-        self.access_token_created_time = time()
-        self.token_live_time = random.randint(500, 900)
-        self.enable_pumpkins = settings.ENABLE_AUTO_PUMPKINS or False
+        self.default_template = {
+            'x': 244,
+            'y': 244,
+            'image_size': 510,
+            'image': None
+        }
+        self.template_id = None
+        self.can_run = True
+        self.cache = os.path.join(os.getcwd(), "cache")
 
-        headers['User-Agent'] = self.check_user_agent()
-        headers_notcoin['User-Agent'] = headers['User-Agent']
-
-    async def generate_random_user_agent(self):
-        return generate_random_user_agent(device_type='android', browser_type='chrome')
-
-    def info(self, message):
-        from bot.utils import info
-        info(f"<light-yellow>{self.session_name} | </light-yellow>{message}")
-
-    def debug(self, message):
-        from bot.utils import debug
-        debug(f"<light-yellow>{self.session_name} | </light-yellow>{message}")
-
-    def warning(self, message):
-        from bot.utils import warning
-        warning(f"<light-yellow>{self.session_name} | </light-yellow>{message}")
-
-    def error(self, message):
-        from bot.utils import error
-        error(f"<light-yellow>{self.session_name} | </light-yellow>{message}")
-
-    def critical(self, message):
-        from bot.utils import critical
-        critical(f"<light-yellow>{self.session_name} | </light-yellow>{message}")
-
-    def success(self, message):
-        from bot.utils import success
-        success(f"<light-yellow>{self.session_name} | </light-yellow>{message}")
-
-    def save_user_agent(self):
-        user_agents_file_name = "user_agents.json"
-
-        if not any(session['session_name'] == self.session_name for session in self.session_ug_dict):
-            user_agent_str = generate_random_user_agent()
-
-            self.session_ug_dict.append({
-                'session_name': self.session_name,
-                'user_agent': user_agent_str})
-
-            with open(user_agents_file_name, 'w') as user_agents:
-                json.dump(self.session_ug_dict, user_agents, indent=4)
-
-            self.success(f"User agent saved successfully")
-
-            return user_agent_str
-
-    def load_user_agents(self):
-        user_agents_file_name = "user_agents.json"
-
-        try:
-            with open(user_agents_file_name, 'r') as user_agents:
-                session_data = json.load(user_agents)
-                if isinstance(session_data, list):
-                    return session_data
-
-        except FileNotFoundError:
-            logger.warning("User agents file not found, creating...")
-
-        except json.JSONDecodeError:
-            logger.warning("User agents file is empty or corrupted.")
-
-        return []
-
-    def check_user_agent(self):
-        load = next(
-            (session['user_agent'] for session in self.session_ug_dict if session['session_name'] == self.session_name),
-            None)
-
-        if load is None:
-            return self.save_user_agent()
-
-        return load
+        self.max_lvl = {
+            "energyLimit": 7,
+            "paintReward": 7,
+            "reChargeSpeed": 11
+        }
+        self.is_max_lvl = {
+            "energyLimit": False,
+            "paintReward": False,
+            "reChargeSpeed": False
+        }
+        self.user_upgrades = None
+        self.template_to_join = 0
 
     async def get_tg_web_data(self, proxy: str | None) -> str:
-        if proxy:
-            proxy = Proxy.from_str(proxy)
-            proxy_dict = dict(
-                scheme=proxy.protocol,
-                hostname=proxy.host,
-                port=proxy.port,
-                username=proxy.login,
-                password=proxy.password
-            )
-        else:
-            proxy_dict = None
-
-        self.tg_client.proxy = proxy_dict
-
         try:
-            with_tg = True
-
-            if not self.tg_client.is_connected:
-                with_tg = False
-                try:
-                    await self.tg_client.connect()
-                except (Unauthorized, UserDeactivated, AuthKeyUnregistered):
-                    raise InvalidSession(self.session_name)
-
-            if settings.USE_REF == True and settings.REF_ID:
-                ref_id = settings.REF_ID
+            if settings.REF_LINK == "":
+                ref_param = "f6624523270"
             else:
-                ref_id = 'f5373988314'
-
-            self.start_param = random.choices([ref_id, 'f5373988314', 'f464869246'], weights=[80, 15, 5])[0]
-
-            peer = await self.tg_client.resolve_peer('notpixel')
-            InputBotApp = types.InputBotAppShortName(bot_id=peer, short_name="app")
-
-            web_view = await self.tg_client.invoke(RequestAppWebView(
-                peer=peer,
-                app=InputBotApp,
-                platform='android',
-                write_allowed=True,
-                start_param=self.start_param
-            ))
-
-            auth_url = web_view.url
-
-            tg_web_data = unquote(
-                string=auth_url.split('tgWebAppData=', maxsplit=1)[1].split('&tgWebAppVersion', maxsplit=1)[0])
-
-            try:
-                if self.user_id == 0:
-                    information = await self.tg_client.get_me()
-                    self.user_id = information.id
-                    self.first_name = information.first_name or ''
-                    self.last_name = information.last_name or ''
-                    self.username = information.username or ''
-            except Exception as e:
-                print(e)
-
-            if with_tg is False:
-                await self.tg_client.disconnect()
-
-            return tg_web_data
-
-        except InvalidSession as error:
-            self.error(f"Session error during Authorization: <light-yellow>{error}</light-yellow>")
-            await asyncio.sleep(delay=10)
-
-        except Exception as error:
-            self.error(
-                f"Unknown error during Authorization: <light-yellow>{error}</light-yellow>")
-            await asyncio.sleep(delay=random.randint(3, 8))
-
-    async def get_tg_web_data_not(self, proxy: str | None) -> str:
+                ref_param = settings.REF_LINK.split("=")[1]
+        except:
+            logger.error(f"{self.session_name} | Ref link invaild please check again !")
+            sys.exit()
+        actual = random.choices([self.my_ref, self.clb_ref, ref_param],
+                                weights=[20, 10, 70])  # edit this line if you don't want to support me
+        # print(actual)
         if proxy:
             proxy = Proxy.from_str(proxy)
             proxy_dict = dict(
@@ -240,12 +117,8 @@ class Tapper:
             proxy_dict = None
 
         self.tg_client.proxy = proxy_dict
-
         try:
-            with_tg = True
-
             if not self.tg_client.is_connected:
-                with_tg = False
                 try:
                     await self.tg_client.connect()
                 except (Unauthorized, UserDeactivated, AuthKeyUnregistered):
@@ -253,30 +126,29 @@ class Tapper:
 
             while True:
                 try:
-                    peer = await self.tg_client.resolve_peer('notgames_bot')
+                    peer = await self.tg_client.resolve_peer('notpixel')
                     break
                 except FloodWait as fl:
-                    fls = fl.value
 
-                    self.warning(f"FloodWait {fl}")
-                    self.info(f"Sleep {fls}s")
-
-                    await asyncio.sleep(fls + 3)
-
-            InputBotApp = types.InputBotAppShortName(bot_id=peer, short_name="squads")
-
+                    logger.warning(f"<light-yellow>{self.session_name}</light-yellow> | FloodWait {fl}")
             web_view = await self.tg_client.invoke(RequestAppWebView(
                 peer=peer,
-                app=InputBotApp,
+                app=InputBotAppShortName(bot_id=peer, short_name="app"),
                 platform='android',
                 write_allowed=True,
+                start_param=actual[0]
             ))
 
             auth_url = web_view.url
-            tg_web_data = unquote(
-                string=auth_url.split('tgWebAppData=', maxsplit=1)[1].split('&tgWebAppVersion', maxsplit=1)[0])
 
-            if with_tg is False:
+            tg_web_data = unquote(string=auth_url.split('tgWebAppData=')[1].split('&tgWebAppVersion')[0])
+
+            tg_web_data_decoded = unquote(unquote(tg_web_data))
+            tg_web_data_json = tg_web_data_decoded.split('user=')[1].split('&chat_instance')[0]
+            user_data = json.loads(tg_web_data_json)
+            self.user_id = user_data['id']
+
+            if self.tg_client.is_connected:
                 await self.tg_client.disconnect()
 
             return tg_web_data
@@ -285,356 +157,288 @@ class Tapper:
             raise error
 
         except Exception as error:
-            self.error(f"Unknown error during getting web data for squads: <light-yellow>{error}</light-yellow>")
-            await asyncio.sleep(delay=random.randint(3, 8))
+            logger.error(f"<light-yellow>{self.session_name}</light-yellow> | Unknown error during Authorization: "
+                         f"{error}")
+            await asyncio.sleep(delay=3)
 
-    def is_night_time(self):
+    async def check_proxy(self, http_client: aiohttp.ClientSession, proxy: Proxy):
         try:
-            night_start = int(settings.NIGHT_TIME[0])
-            night_end = int(settings.NIGHT_TIME[1])
-
-            # Get the current hour
-            current_hour = datetime.now().hour
-
-            if current_hour >= night_start or current_hour < night_end:
-                return True
-
-            return False
-        except Exception as error:
-            self.error(f"Unknown error during checking night time: <light-yellow>{error}</light-yellow>")
-            return False
-
-    def time_until_morning(self):
-        try:
-            morning_time = datetime.now().replace(hour=int(settings.NIGHT_TIME[1]), minute=0, second=0, microsecond=0)
-
-            if datetime.now() >= morning_time:
-                morning_time += timedelta(days=1)
-
-            time_remaining = morning_time - datetime.now()
-
-            return time_remaining.total_seconds() / 60
-        except Exception as error:
-            self.error(f"Unknown error during calculate time until morning: <light-yellow>{error}</light-yellow>")
-            return 0
-
-    async def check_proxy(self, http_client: aiohttp.ClientSession, proxy: Proxy) -> None:
-        try:
-            response = await http_client.get(url='https://httpbin.org/ip', timeout=aiohttp.ClientTimeout(5))
+            response = await http_client.get(url='https://httpbin.org/ip', timeout=aiohttp.ClientTimeout(5), )
             ip = (await response.json()).get('origin')
-            if settings.SHOW_TEMPLATES_LIST:
-                logger.info(f"Proxy IP: {ip}")
-            else:
-                self.info(f"Proxy IP: {ip}")
+            logger.info(f"{self.session_name} | Proxy IP: {ip}")
+            return True
         except Exception as error:
-            if settings.SHOW_TEMPLATES_LIST:
-                logger.error(f"Proxy: {proxy} | Error: {error}")
-            else:
-                self.error(f"Proxy: {proxy} | Error: {error}")
+            logger.error(f"{self.session_name} | Proxy: {proxy} | Error: {error}")
+            return False
 
-    async def get_user_info(self, http_client: aiohttp.ClientSession, show_error_message: bool):
-        ssl = settings.ENABLE_SSL
-        err = None
-        first = True
+    def login(self, session):
+        response = session.get(f"{API_GAME_ENDPOINT}/users/me", headers=headers)
+        if response.status_code == 200:
+            logger.success(f"{self.session_name} | <green>Logged in.</green>")
+            return True
+        else:
+            print(response.json())
+            logger.warning("{self.session_name} | <red>Failed to login</red>")
+            return False
 
-        for _ in range(3):
-            try:
-                response = await http_client.get("https://notpx.app/api/v1/users/me", ssl=ssl)
-
-                response.raise_for_status()
-
-                data = await response.json()
-
-                err = None
-
-                return data
-            except Exception as error:
-#                 ssl = not ssl
-                if first:
-                    first = False
-                    self.info(f"First get user info request not always successful, retrying..")
-                await asyncio.sleep(delay=random.randint(3, 6))
-                err = error
-                continue
-
-        if err != None and show_error_message == True:
-            if self.check_timeout_error(err) or self.check_error(err, "Service Unavailable"):
-                self.warning(f"Warning during getting user info: <magenta>Notpixel</magenta> server is not response.")
-            else:
-                self.error(f"Unknown error during getting user info: <light-yellow>{err}</light-yellow>")
+    def get_user_data(self, session):
+        response = session.get(f"{API_GAME_ENDPOINT}/mining/status", headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(response.json())
             return None
 
-    async def get_status(self, http_client: aiohttp.ClientSession, show_error_message: bool = True):
-        for _ in range(3):
+    def generate_random_color(self, color):
+        a = random.choice(self.color_list)
+        while a == color:
+            a = random.choice(self.color_list)
+        return a
+
+    def generate_random_pos(self):
+        return randint(1, 1000000)
+
+    def repaintV2(self, session, chance_left, i, data):
+        if i % 2 == 0:
+            payload = {
+                "newColor": data[0],
+                "pixelId": data[1]
+            }
+
+        else:
+            data1 = [str(self.generate_random_color(data[0])), int(self.generate_random_pos())]
+            payload = {
+                "newColor": data1[0],
+                "pixelId": data[1]
+            }
+        response = session.post(f"{API_GAME_ENDPOINT}/repaint/start", headers=headers, json=payload)
+        if response.status_code == 200:
+            if i % 2 == 0:
+                logger.success(
+                    f"{self.session_name} | <green>Painted <cyan>{data[1]}</cyan> successfully new color: <cyan>{data[0]}</cyan> | Earned <light-blue>{int(response.json()['balance']) - self.balance}</light-blue> | Balace: <light-blue>{response.json()['balance']}</light-blue> | Repaint left: <yellow>{chance_left}</yellow></green>")
+                self.balance = int(response.json()['balance'])
+
+            else:
+                logger.success(
+                    f"{self.session_name} | <green>Painted <cyan>{data[1]}</cyan> successfully new color: <cyan>{data1[0]}</cyan> | Earned <light-blue>{int(response.json()['balance']) - self.balance}</light-blue> | Balace: <light-blue>{response.json()['balance']}</light-blue> | Repaint left: <yellow>{chance_left}</yellow></green>")
+                self.balance = int(response.json()['balance'])
+        else:
+            print(response.text)
+            logger.warning(f"{self.session_name} | Faled to repaint: {response.status_code}")
+
+    async def auto_upgrade_paint(self, session):
+        if self.user_upgrades['paintReward'] >= self.max_lvl['paintReward']:
+            self.is_max_lvl['paintReward'] = True
+            return
+        res = session.get(f"{API_GAME_ENDPOINT}/mining/boost/check/paintReward", headers=headers)
+        if res.status_code == 200:
+            logger.success(f"{self.session_name} | <green>Upgrade paint reward successfully!</green>")
+        await asyncio.sleep(random.uniform(2, 4))
+
+    async def auto_upgrade_recharge_speed(self, session):
+        if self.user_upgrades['reChargeSpeed'] >= self.max_lvl['reChargeSpeed']:
+            self.is_max_lvl['reChargeSpeed'] = True
+            return
+        res = session.get(f"{API_GAME_ENDPOINT}/mining/boost/check/reChargeSpeed", headers=headers)
+        if res.status_code == 200:
+            logger.success(f"{self.session_name} | <green>Upgrade recharging speed successfully!</green>")
+        await asyncio.sleep(random.uniform(2, 4))
+
+    async def auto_upgrade_energy_limit(self, session):
+        if self.user_upgrades['energyLimit'] >= self.max_lvl['energyLimit']:
+            self.is_max_lvl['energyLimit'] = True
+            return
+        res = session.get(f"{API_GAME_ENDPOINT}/mining/boost/check/energyLimit", headers=headers)
+        if res.status_code == 200:
+            logger.success(f"{self.session_name} | <green>Upgrade energy limit successfully!</green>")
+
+    def claimpx(self, session):
+        res = session.get(f"{API_GAME_ENDPOINT}/mining/claim", headers=headers)
+        if res.status_code == 200:
+            logger.success(
+                f"{self.session_name} | Successfully claimed <cyan>{res.json()['claimed']}</cyan> px from mining!")
+            self.balance += res.json()['claimed']
+
+        else:
+            logger.warning(f"{self.session_name} | Failed to claim px from mining: {res.json()}")
+
+    async def subscribe_template(self, session, template_id: int):
+        for attempt in range(3):
             try:
-                response = await http_client.get('https://notpx.app/api/v1/mining/status', ssl=settings.ENABLE_SSL)
 
-                response.raise_for_status()
+                resp = session.put(f'{API_GAME_ENDPOINT}/image/template/subscribe/{template_id}', headers=headers)
 
-                data = await response.json()
-
-                return data
-
-            except Exception as error:
-                if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                    self.warning(f"Warning during processing mining status: <magenta>Notpixel</magenta> server is not response. Retrying..")
-                    await asyncio.sleep(delay=random.randint(3, 6))
-                    continue
+                if resp.status_code == 200 or resp.status_code == 204:
+                    logger.success(
+                        f"{self.session_name} | <green>Started using template: <cyan>{template_id}</cyan></green>")
+                    return True
                 else:
-                    self.error(f"Unknown error during processing mining status: <light-yellow>{error}</light-yellow>")
-                    await asyncio.sleep(delay=random.randint(3, 6))
-                    return None
+                    print(resp.text)
+                    return False
+            except Exception as e:
+                if resp.status_code == 504:
+                    logger.warning(f"{self.session_name} | Attempt {attempt}: Connection timeout, retry after 3-5s...")
+                    await asyncio.sleep(random.randint(3, 5))
+                else:
+                    logger.error(
+                        f"{self.session_name} | <red>Unknown error while subscribing to template {template_id}: <light-yellow>{e}</light-yellow> </red>")
 
+    async def get_template(self, session):
+        for attempts in range(3):
+            try:
+                res = session.get(f'{API_GAME_ENDPOINT}/image/template/my', headers=headers)
+
+                if res.status_code == 200:
+                    return res.json()
+                else:
+                    return None
+            except Exception as e:
+                if res.status_code == 504:
+                    logger.warning(f"{self.session_name} | Attempt {attempts}: Connection timeout, retry after 3-5s...")
+                    await asyncio.sleep(random.randint(3, 5))
+                else:
+                    logger.error(
+                        f"{self.session_name} | <red>Unknown error while getting template info: <light-yellow>{e}</light-yellow></red>")
+                    return None
         return None
 
-    async def get_balance(self, http_client: aiohttp.ClientSession):
-        try:
-            response = await http_client.get('https://notpx.app/api/v1/mining/status', ssl=settings.ENABLE_SSL)
-
-            response.raise_for_status()
-
-            data = await response.json()
-
-            return data['userBalance']
-        except Exception as error:
-            if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                self.warning(f"Warning during processing balance: <magenta>Notpixel</magenta> server is not response.")
-            else:
-                self.error(f"Unknown error during processing balance: <light-yellow>{error}</light-yellow>")
-            await asyncio.sleep(delay=random.randint(3, 6))
-            return None
-
-    async def get_image(self, http_client, url, image_headers, load_from_file=True, is_template=True):
-        # Extract the image filename from the URL
-        image_filename = os.path.join(self.image_directory, url.split("/")[-1])
-
-        # Check if image exists in file system
-        try:
-            if load_from_file and os.path.exists(image_filename):
-                # Open and return the image from file system
-                img = Image.open(image_filename)
-                img.load()  # Load the image data
-                return img
-        except Exception as error:
-            self.error(f"Failed to load image from file: {image_filename} | Error: {error} | Please use other template ID")
-
-        tries_count = 0
-        # If not, download the image from the URL
-        for _ in range(2):
-            tries_count = tries_count + 1
+    async def get_template_info(self, session):
+        for attempts in range(3):
             try:
-                if self.image_scraper:
-                    response = self.image_scraper.get(url, headers=image_headers, proxies=self.image_scraper_proxies)
-
-                    if response.status_code == 200:
-                        img_data = response.content
-                        img = Image.open(io.BytesIO(img_data))
-
-                        # Save the image to the file system
-                        if load_from_file:
-                            img.save(image_filename)
-
-                            if is_template:
-                                self.success(f"Template image from <cyan>{url}</cyan>, successfully loaded and saved to <cyan>{image_filename}</cyan>.")
-                        return img
-                    else:
-                        if tries_count > 1:
-                            self.warning(f"Failed to download image from {url}, status: {response.status_code} | Please use other template ID")
-                        else:
-                            self.warning(f"Failed to download image from {url}, status: {response.status_code}")
-                else:
-                    async with http_client.get(url, headers=image_headers) as response:
-                        if response.status == 200:
-                            img_data = await response.read()
-                            img = Image.open(io.BytesIO(img_data))
-
-                            # Save the image to the file system
-                            if load_from_file:
-                                img.save(image_filename)
-
-                                if is_template:
-                                    self.success(f"Template image from <cyan>{url}</cyan>, successfully loaded and saved to <cyan>{image_filename}</cyan>.")
-
-                            return img
-                        else:
-                            if tries_count > 1:
-                                self.warning(f"Failed to download image from {url}, status: {response.status} | Please use other template ID")
-                            else:
-                                self.warning(f"Failed to download image from {url}, status: {response.status}")
-
-            except Exception as error:
-                if self.check_error(error, 'Failed to download'):
-                    self.warning(f"Warning during loading template image: {url}. Retrying.. {error}")
-                    await asyncio.sleep(delay=random.randint(5, 10))
-                    continue
-                else:
-                    self.error(f"Error during loading template image: {url} | Error: {error}")
-                    return None
-
-    async def clean_images_cache(self):
-        try:
-            png_files = glob.glob(os.path.join(self.image_directory, '*.png'))
-
-            if len(png_files) > 0:
-                # Delete each .png file
-                for file_path in png_files:
-                    os.remove(file_path)
-
-                logger.success(f"Images cache directory successfully cleaned.")
-        except Exception as error:
-            return None
-
-    async def send_draw_request(self, http_client: aiohttp.ClientSession, update, template_id=None, special=False):
-        pixelId, x, y, color = update
-
-        if special == True:
-            payload = {"pixelId": int(pixelId), "type": 7} # pumping
-            draw_request = await http_client.post(
-                'https://notpx.app/api/v1/repaint/special',
-                json=payload,
-                ssl=settings.ENABLE_SSL,
-            )
-        else:
-            payload = {"pixelId": int(pixelId), "newColor": color}
-
-            json_string = json.dumps(payload, separators=(',', ':'))
-
-            draw_headers = deepcopy(headers)
-            draw_headers['Content-Length'] = str(len(json_string))
-
-            draw_request = await http_client.post(
-                'https://notpx.app/api/v1/repaint/start',
-                json=payload,
-                ssl=settings.ENABLE_SSL,
-            )
-
-        if special:
-            if draw_request.status == 200:
-                data = await draw_request.json()
-
-                self.success(f"<cyan>[PUMPKINS MODE]</cyan> Painted")
-                return True
-            else:
-                return False
-
-        else:
-            draw_request.raise_for_status()
-
-            data = await draw_request.json()
-
-            new_balance = data.get('balance', 0)
-            added_points = round(new_balance - self.current_user_balance)
-            self.current_user_balance = new_balance
-
-            if template_id:
-                self.success(f"<cyan>[{self.mode}]</cyan> Painted with color <light-blue>{color}</light-blue> | <cyan>+{added_points} PX</cyan> | Template <cyan>{template_id}</cyan>")
-            else:
-                self.success(f"<cyan>[{self.mode}]</cyan> Painted with color <light-blue>{color}</light-blue> | <cyan>+{added_points} PX</cyan>")
-            return None
-
-    def check_timeout_error(self, error):
-         try:
-             error_message = str(error)
-             is_timeout_error = re.search("504, message='Gateway Timeout'", error_message)
-             return is_timeout_error
-         except Exception as e:
-             return False
-
-    def check_error(self, error, message):
-        try:
-            error_message = str(error)
-            is_equal = re.search(message, error_message)
-            return is_equal
-        except Exception as e:
-            return False
-
-    async def subscribe_to_template(self, http_client: aiohttp.ClientSession, template_id: int):
-        for _ in range(3):
-            try:
-                subscribe_headers = deepcopy(headers)
-                subscribe_headers['Content-Length'] = 0
-                response = await http_client.put(f'https://notpx.app/api/v1/image/template/subscribe/{template_id}', ssl=settings.ENABLE_SSL)
-
-                if response.status == 200 or response.status == 204:
-                    return True
-
-                return False
-            except Exception as error:
-                if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                    self.warning(f"Warning during subscribe to template: <magenta>Notpixel</magenta> server is not response. Retrying..")
-                    await asyncio.sleep(delay=random.randint(3, 5))
-                    continue
-                else:
-                    if error:
-                        self.error(f"Unknown error during subscribe to template: <light-yellow>{error}</light-yellow>")
-                    else:
-                        self.error(f"Unknown error during subscribe to template.")
-                    await asyncio.sleep(delay=random.randint(3, 5))
-                    return False
-        return False
-    async def get_user_current_template(self, http_client: aiohttp.ClientSession):
-        for _ in range(3):
-            try:
-                response = await http_client.get('https://notpx.app/api/v1/image/template/my', ssl=settings.ENABLE_SSL)
-
-                if response.status == 200:
-                    data = await response.json()
-                    return data
-                else:
-                    return None
-            except Exception as error:
-                if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                    self.warning(f"Warning during getting template info: <magenta>Notpixel</magenta> server is not response. Retrying..")
-                    await asyncio.sleep(delay=random.randint(3, 5))
-                    continue
-                else:
-                    if error:
-                        self.error(f"Unknown error during getting template info: <light-yellow>{error}</light-yellow>")
-                    else:
-                        self.error(f"Unknown error during getting template info.")
-                    await asyncio.sleep(delay=random.randint(3, 5))
-                    return None
-
-    async def get_template_info(self, http_client: aiohttp.ClientSession, template_id: int):
-        for _ in range(3):
-            try:
-                response = await http_client.get(f'https://notpx.app/api/v1/image/template/{template_id}', ssl=settings.ENABLE_SSL)
-
-                response.raise_for_status()
-
-                data = await response.json()
+                res = session.get(f'https://notpx.app/api/v1/image/template/my',
+                                  headers=headers)
+                data = res.json()
 
                 return data
-            except Exception as error:
-                if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                    self.warning(f"Warning during getting template info: <magenta>Notpixel</magenta> server is not response. Retrying..")
-                    await asyncio.sleep(delay=random.randint(3, 5))
+            except Exception as e:
+                if res.status_code == 504:
+                    logger.warning(f"{self.session_name} | Attempt {attempts}: Connection timeout, retry after 3-5s...")
+                    await asyncio.sleep(random.randint(3, 5))
                     continue
                 else:
-                    if error:
-                        self.error(f"Unknown error during getting template info: <light-yellow>{error}</light-yellow>")
-                    else:
-                        self.error(f"Unknown error during getting template info.")
+                    logger.error(
+                        f"{self.session_name} | <red>Unknown error while getting template info: <light-yellow>{e}</light-yellow></red>")
                     break
-                    await asyncio.sleep(delay=random.randint(3, 5))
 
-    async def get_updated_image(self, http_client: aiohttp.ClientSession):
+    async def notpx_template(self, session):
         try:
-            current_image_url = 'https://image.notpx.app/api/v2/image'
-            image_headers = deepcopy(headers)
-            image_headers['Host'] = 'image.notpx.app'
-
-            current_image = await self.get_image(http_client, current_image_url, image_headers=image_headers, load_from_file=False, is_template=False)  # Аргумент image_headers не потрібен
-            return current_image
+            stats_req = session.get(f'{API_GAME_ENDPOINT}/image/template/my', headers=headers)
+            stats_req.raise_for_status()
+            cur_template = stats_req.json()
+            return cur_template.get("id")
         except Exception as error:
-            self.error(f"Unknown error during getting updated image: <light-yellow>{error}</light-yellow>")
+            return 0
 
-    async def draw_template(self, http_client: aiohttp.ClientSession, template_info):
+    async def need_join_template(self, session):
+        try:
+            tmpl = await self.notpx_template(session)
+            self.template_to_join = template_to_join(tmpl)
+            return str(tmpl) != self.template_to_join
+        except Exception as error:
+            logger.error(f"Failed to determine template join requirement: {error}")
+            return False
+
+    async def join_template(self, session, template_id):
+        try:
+            resp = session.put(f"{API_GAME_ENDPOINT}/image/template/subscribe/{template_id}", headers=headers)
+            resp.raise_for_status()
+            return resp.status_code == 204
+        except Exception as error:
+            logger.error(f"Error joining template: {error}")
+            return False
+
+    async def make_paint_request(self, session, yx, color, delay_start, delay_end):
+        try:
+            paint_request = session.post(f'{API_GAME_ENDPOINT}/repaint/start',
+                                         json={"pixelId": int(yx), "newColor": color}, headers=headers)
+            paint_request.raise_for_status()
+            paint_request_json = paint_request.json()
+            cur_balance = paint_request_json.get("balance", self.balance)
+            change = max(0, cur_balance - self.balance)
+            self.balance = cur_balance
+            logger.success(
+                f"{self.session_name} | Painted <cyan>{yx}</cyan> with color: <cyan>{color}</cyan> | Earned +<red>{change}</red> px | Balance: <cyan>{self.balance}</cyan> px")
+
+            await asyncio.sleep(delay=randint(delay_start, delay_end))
+            return True
+
+        except json.JSONDecodeError:
+            logger.info(f"{self.session_name} | Server does not response!")
+            return False
+
+        except requests.RequestException as e:
+            logger.error(f"{self.session_name} | Failed to paint due to network error: {e}")
+            await asyncio.sleep(5)
+            return False
+
+    async def paint(self, session, retries=10):
+        try:
+            stats_json = self.get_user_data(session)
+            if stats_json is None:
+                logger.warning(f"{self.session_name} | Failed to get user data!")
+                return
+            charges = stats_json.get('charges', 24)
+            self.balance = stats_json.get('userBalance', 0)
+            max_charges = stats_json.get('maxCharges', 24)
+            logger.info(f"{self.session_name} | Charges: <yellow>{charges}/{max_charges}</yellow>")
+
+            if await self.need_join_template(session):
+                result = await self.join_template(session, self.template_to_join)
+                if result:
+                    logger.success(
+                        f"{self.session_name} | <green>Successfully joined template <cyan>{self.template_to_join}</cyan></green>")
+                else:
+                    logger.warning(
+                        f"{self.session_name} | <yellow>Failed to join template: {self.template_to_join}</yellow>")
+                    return
+
+            for _ in range(charges):
+                try:
+                    q = get_cords_and_color(user_id=self.user_id, template=self.template_to_join)
+                    coords = q["coords"]
+                    color = q["color"]
+                    yx = coords
+                    a = await self.make_paint_request(session, yx, color, 5, 10)
+                    if a is False:
+                        return
+                except Exception as error:
+                    logger.warning(
+                        f"{self.session_name} | <yellow>No pixels to paint or error occurred: {error}</yellow>")
+                    return
+
+        except json.JSONDecodeError:
+            logger.info(f"{self.session_name} | Error during painting: Server does not response!")
+
+        except requests.RequestException as error:
+            logger.error(f"Error during painting: {error}")
+            if retries > 0:
+                await asyncio.sleep(10)
+                logger.info(f"{self.session_name} | Retry after 10 seconds...")
+                await self.paint(session, retries=retries - 1)
+
+    def paintv2(self, session, x, y, color, chance_left):
+        pxId = y * 1000 + x + 1
+        payload = {
+            "pixelId": pxId,
+            "newColor": color
+        }
+
+        res = session.post(f"{API_GAME_ENDPOINT}/repaint/start", headers=headers,
+                           json=payload)
+        if res.status_code == 200:
+            logger.success(
+                f"{self.session_name} | <green>Painted <cyan>{pxId}</cyan> successfully new color: <cyan>{color}</cyan> | Earned <light-blue>{round(int(res.json()['balance']) - self.balance)}</light-blue> | Balace: <light-blue>{res.json()['balance']}</light-blue> | Repaint left: <yellow>{chance_left}</yellow></green>")
+            self.balance = int(res.json()['balance'])
+            return True
+        else:
+            logger.warning(f"{self.session_name} | Faled to repaint: {res.status_code}")
+            return False
+
+    async def repaintV5(self, session, template_info):
         try:
             if not template_info:
                 return None
 
-            curr_template_id = template_info.get('id', 'Durov')
             curr_image = template_info.get('image', None)
             curr_start_x = template_info.get('x', 0)
             curr_start_y = template_info.get('y', 0)
@@ -643,704 +447,342 @@ class Tapper:
             if not curr_image:
                 return None
 
-            status_data = await self.get_status(http_client=http_client)
+            user_data = self.get_user_data(session)
 
-            if status_data == None:
+            if user_data is None:
                 return None
 
-            charges = status_data['charges']
-            maxCharges = status_data['maxCharges']
+            Total_attempt = user_data['charges']
 
-            self.current_user_balance = status_data['userBalance']
+            self.balance = user_data['userBalance']
 
-            if charges > 0:
-                self.info(f"Energy: <magenta>{charges}</magenta>/<cyan>{maxCharges}</cyan> ⚡️")
+            if Total_attempt > 0:
+                logger.info(f"{self.session_name} | Starting to paint...")
             else:
-                self.info(f"No energy ⚡️")
+                logger.info(f"{self.session_name} | No energy left...")
                 return None
 
             tries = 2
 
-            random_x_offset = random.randint(50, curr_image_size - 10)
-            random_y_offset = random.randint(50, curr_image_size - 10)
-
-            updated_image = None
-
-            updated_image_get_time = 0
-            updated_image_live_time = random.randint(5, 10)
-
-            if settings.ENABLE_CHECK_UPDATED_IMAGE_MODE:
-                updated_image = await self.get_updated_image(http_client=http_client)
-                updated_image_get_time = time()
-
-            while charges > 0:
+            while Total_attempt > 0:
                 try:
-                    for x in range(curr_image_size):
-                        curr_x = x + random_x_offset
-                        if charges == 0:
-                            break
-
-                        if settings.ENABLE_CHECK_UPDATED_IMAGE_MODE and (time() - updated_image_get_time >= updated_image_live_time):
-                            updated_image = await self.get_updated_image(http_client=http_client)
-                            updated_image_get_time = time()
-
-                        for y in range(curr_image_size):
-                            curr_y = y + random_y_offset
-                            if charges == 0:
-                                break
-
-                            if settings.ENABLE_CHECK_UPDATED_IMAGE_MODE and (time() - updated_image_get_time >= updated_image_live_time):
-                                updated_image = await self.get_updated_image(http_client=http_client)
-                                updated_image_get_time = time()
-
-                            updated_image_pixel = None
-                            updated_image_hex_color = None
-
-                            self.info(f"{curr_x}, {curr_y}")
-
-                            if updated_image:
-                                updated_image_pixel = updated_image.getpixel((curr_x, curr_y))
-                                updated_image_hex_color = '#{:02x}{:02x}{:02x}'.format(*updated_image_pixel)
-
-                            image_pixel = curr_image.getpixel((curr_x, curr_y))
-                            image_hex_color = '#{:02x}{:02x}{:02x}'.format(*image_pixel)
-
-                            if updated_image_hex_color != image_hex_color:
-                                charges = charges - 1
-                                pixelId = int(f'{curr_start_y + curr_y}{curr_start_x + curr_x}')+1
-
-                                await self.send_draw_request(http_client=http_client, update=(pixelId, curr_start_x + curr_x, curr_start_y + curr_y, image_hex_color.upper()), template_id=curr_template_id)
-                                await asyncio.sleep(delay=random.randint(4, 8))
-                            else:
-                                await asyncio.sleep(delay=random.randint(3, 6))
-                            continue
+                    x = randint(0, curr_image_size - 5)
+                    y = randint(0, curr_image_size - 5)
+                    if Total_attempt == 0:
+                        return
+                    image_pixel = curr_image.getpixel((x, y))
+                    image_hex_color = '#{:02x}{:02x}{:02x}'.format(*image_pixel)
+                    Total_attempt -= 1
+                    if self.paintv2(session, curr_start_x + x, curr_start_y + y, image_hex_color.upper(),
+                                    Total_attempt) is False:
+                        return
+                    await asyncio.sleep(delay=random.randint(4, 10))
                 except Exception as e:
-                    if self.check_timeout_error(e) or self.check_error(e, "Service Unavailable"):
-                        status_data = await self.get_status(http_client=http_client, show_error_message=False)
+                    if 'Gateway Timeout' in str(e):
+                        status_data = self.get_user_data(session)
 
                         if status_data:
                             charges = status_data['charges']
-                            self.current_user_balance = status_data['userBalance']
+                            self.balance = status_data['userBalance']
 
                         if tries > 0 and charges > 0:
-                            self.warning(f"Warning during painting <cyan>[{self.mode}]</cyan>: <magenta>Notpixel</magenta> server is not response. Retrying..")
+                            logger.warning(
+                                f"{self.session_name} | server is not response. Retrying..")
                             tries = tries - 1
                             sleep_time = random.randint(10, 20)
-                            self.info(f"Restart drawing in {round(sleep_time)} seconds...")
+                            logger.info(f"{self.session_name} | Restart drawing in {round(sleep_time)} seconds...")
                             await asyncio.sleep(delay=sleep_time)
                             continue
                         else:
-                            self.warning(f"Warning during painting <cyan>[{self.mode}]</cyan>: <magenta>Notpixel</magenta> server is not response. Go to sleep..")
+                            logger.warning(
+                                f"{self.session_name} | server is not response. Go to sleep..")
                             break
-                    elif self.check_error(e, "Bad Request"):
-                        self.warning(f"Warning during painting <cyan>[{self.mode}]</cyan>: <light-yellow>Bad Request</light-yellow>. Go to sleep..")
+                    elif "Bad Request" in str(e):
+                        logger.warning(
+                            f" Go to sleep..")
                         break
                     else:
-                        self.error(f"Unknown error during painting <cyan>[{self.mode}]</cyan>: {e}")
+                        logger.error(
+                            f"{self.session_name} | <red>Unknown error while painting: <light-yellow>{e}</light-yellow></red>")
                         break
-        except Exception as error:
-            if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                self.warning(f"Warning during painting <cyan>[{self.mode}]</cyan>: <magenta>Notpixel</magenta> server is not response. Go to sleep..")
-            elif self.check_error(error, "Bad Request"):
-                self.warning(f"Warning during painting <cyan>[{self.mode}]</cyan>: <light-yellow>Bad Request</light-yellow>. Go to sleep..")
-            else:
-                if error:
-                    self.error(f"Unknown error during painting <cyan>[{self.mode}]</cyan>: <light-yellow>{error}</light-yellow>")
-                else:
-                    self.error(f"Unknown error during painting <cyan>[{self.mode}]</cyan>.")
-            await asyncio.sleep(delay=random.randint(2, 5))
 
-    async def draw_server_mode(self, http_client: aiohttp.ClientSession, retries=20):
-        try:
-            status_data = await self.get_status(http_client=http_client)
-
-            if status_data == None:
-                return None
-
-            charges = status_data['charges']
-            maxCharges = status_data['maxCharges']
-
-            self.current_user_balance = status_data['userBalance']
-
-            if charges > 0:
-                self.info(f"Energy: <magenta>{charges}</magenta>/<cyan>{maxCharges}</cyan> ⚡️")
-            else:
-                self.info(f"No energy ⚡️")
-                return None
-
-            for _ in range(charges - 1):
-                try:
-                    response = await get_cords_and_color(user_id=self.user_id, template=self.template_id_to_join, session_name=self.session_name)
-                except Exception as error:
-                    self.info(f"No pixels to paint")
-                    return
-
-                pixelId = response["coords"]
-                color = response["color"]
-
-                updated_y = int(str(pixelId)[:3])
-                updated_x = int(str(pixelId)[3:]) - 1
-
-                await asyncio.sleep(delay=5)
-
-                await self.send_draw_request(http_client, update=(pixelId, updated_x, updated_y, color), template_id=self.template_id_to_join)
-
-        except Exception as error:
-            if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable") or self.check_error(error, "Internal Server Error"):
-                self.warning(f"Warning during drawing <cyan>[{self.mode}]</cyan>: <magenta>Notpixel</magenta> server is not response. Retrying..")
-            await asyncio.sleep(delay=10)
-            if retries > 0:
-                await self.draw_server_mode(http_client=http_client, retries=retries-1)
-
-    async def upgrade(self, http_client: aiohttp.ClientSession):
-        try:
-            while True:
-                response = await http_client.get('https://notpx.app/api/v1/mining/status', ssl=settings.ENABLE_SSL)
-
-                response.raise_for_status()
-
-                data = await response.json()
-
-                boosts = data['boosts']
-
-                self.info(f"Boosts Levels: Energy Limit - <cyan>{boosts['energyLimit']}</cyan> ⚡️| Paint Reward - <light-green>{boosts['paintReward']}</light-green> | Recharge Speed - <magenta>{boosts['reChargeSpeed']}</magenta> ")
-
-                if boosts['energyLimit'] >= settings.ENERGY_LIMIT_MAX and boosts['paintReward'] >= settings.PAINT_REWARD_MAX and boosts['reChargeSpeed'] >= settings.RE_CHARGE_SPEED_MAX:
-                    return None
-
-                for name, level in sorted(boosts.items(), key=lambda item: item[1]):
-                    if name == 'energyLimit' and level >= settings.ENERGY_LIMIT_MAX:
-                        continue
-
-                    if name == 'paintReward' and level >= settings.PAINT_REWARD_MAX:
-                        continue
-
-                    if name == 'reChargeSpeed' and level >= settings.RE_CHARGE_SPEED_MAX:
-                        continue
-
-                    if name not in settings.BOOSTS_BLACK_LIST:
-                        try:
-                            res = await http_client.get(f'https://notpx.app/api/v1/mining/boost/check/{name}', ssl=settings.ENABLE_SSL)
-
-                            res.raise_for_status()
-
-                            self.success(f"Upgraded boost: <cyan>{name}</<cyan>")
-
-                            await asyncio.sleep(delay=random.randint(2, 5))
-                        except Exception as error:
-                            self.warning(f"Not enough money to keep upgrading.")
-
-                            await asyncio.sleep(delay=random.randint(5, 10))
-                            return None
-
-        except Exception as error:
-            if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                self.warning(f"Warning during upgrading: <magenta>Notpixel</magenta> server is not response.")
-            else:
-                self.error(f"Unknown error during upgrading: <light-yellow>{error}</light-yellow>")
-            await asyncio.sleep(delay=3)
-
-    async def run_tasks(self, http_client: aiohttp.ClientSession):
-        try:
-            res = await http_client.get('https://notpx.app/api/v1/mining/status', ssl=settings.ENABLE_SSL)
-
-            await asyncio.sleep(delay=random.randint(1, 3))
-
-            res.raise_for_status()
-
-            data = await res.json()
-
-            tasks = data['tasks'].keys()
-
-            already_joined_to_one_channel_in_loop = False
-
-            for task in settings.TASKS_TODO_LIST:
-                if self.user != None and task == 'premium' and not 'isPremium' in self.user:
-                    continue
-
-                if self.user != None and task == 'leagueBonusSilver' and self.user['repaints'] < 9:
-                    continue
-
-                if self.user != None and task == 'leagueBonusGold' and self.user['repaints'] < 129:
-                    continue
-
-                if self.user != None and task == 'leagueBonusPlatinum' and self.user['repaints'] < 2049:
-                    continue
-
-                if task not in tasks:
-                    if re.search(':', task) is not None:
-                        split_str = task.split(':')
-                        social = split_str[0]
-                        name = split_str[1]
-
-                        if social == 'channel' and settings.UNSAFE_ENABLE_JOIN_TG_CHANNELS:
-                            if already_joined_to_one_channel_in_loop:
-                                continue
-
-                            try:
-                                already_joined_to_one_channel_in_loop = True
-                                if not self.tg_client.is_connected:
-                                    await self.tg_client.connect()
-                                await asyncio.sleep(delay=random.randint(10, 20))
-                                await self.tg_client.join_chat(name)
-                                await asyncio.sleep(delay=random.randint(10, 20))
-                                self.success(f"Successfully joined to the <cyan>{name}</cyan> channel ✔")
-                            except Exception as error:
-                                self.error(f"Unknown error during joining to {name} channel: <light-yellow>{error}</light-yellow>")
-                            finally:
-                                # Disconnect the client only if necessary, for instance, when the entire task is done
-                                if self.tg_client.is_connected:
-                                    await self.tg_client.disconnect()
-
-                                await asyncio.sleep(delay=random.randint(10, 20))
-
-                        response = await http_client.get(f'https://notpx.app/api/v1/mining/task/check/{social}?name={name}', ssl=settings.ENABLE_SSL)
-                    else:
-                        response = await http_client.get(f'https://notpx.app/api/v1/mining/task/check/{task}', ssl=settings.ENABLE_SSL)
-
-                    response.raise_for_status()
-
-                    data = await response.json()
-
-                    status = data[task]
-
-                    if status:
-                        self.success(f"Task requirements met. Task <cyan>{task}</cyan> completed ✔")
-
-                        current_balance = await self.get_balance(http_client=http_client)
-
-                        self.current_user_balance = current_balance
-
-                        if current_balance is None:
-                            self.info(f"Current balance: Unknown")
-                        else:
-                            self.info(f"Balance: <light-green>{'{:,.3f}'.format(current_balance)}</light-green>")
-                    else:
-                        self.warning(f"Task requirements were not met <cyan>{task}</cyan>")
-
-                    await asyncio.sleep(delay=random.randint(3, 7))
-
-        except Exception as error:
-            if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                self.warning(f"Warning during processing tasks: <magenta>Notpixel</magenta> server is not response.")
-            else:
-                self.error(f"Unknown error during processing tasks: <light-yellow>{error}</light-yellow>")
-            await asyncio.sleep(delay=random.randint(3, 7))
-
-    async def claim_mine(self, http_client: aiohttp.ClientSession):
-        try:
-            response = await http_client.get(f'https://notpx.app/api/v1/mining/status', ssl=settings.ENABLE_SSL)
-
-            response.raise_for_status()
-
-            response_json = await response.json()
-
-            await asyncio.sleep(delay=random.randint(4, 6))
-
-            for _ in range(2):
-                try:
-                    response = await http_client.get(f'https://notpx.app/api/v1/mining/claim', ssl=settings.ENABLE_SSL)
-
-                    response.raise_for_status()
-
-                    response_json = await response.json()
-                except Exception as error:
-                    self.info(f"First claiming not always successful, retrying..")
-                else:
-                    break
-
-            return response_json.get('claimed', 0)
-        except Exception as error:
-            if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                self.warning(f"Warning during claiming reward: <magenta>Notpixel</magenta> server is not response.")
-            else:
-                self.error(f"Unknown error during claiming reward: <light-yellow>{error}</light-yellow>")
-            await asyncio.sleep(delay=3)
-            return 0
-
-    async def check_join_template(self, http_client: aiohttp.ClientSession):
-        try:
-            my_template = await self.get_user_current_template(http_client)
-            my_template_id = None
-            if my_template != None:
-                my_template_id = my_template.get('id', None)
-            self.template_id_to_join = await template_to_join(my_template_id, times_to_fall=20, session_name=self.session_name)
-            return str(my_template_id) != self.template_id_to_join
-        except Exception as error:
-            self.error(f"Unknown error during check joining template: <light-yellow>{error}</light-yellow>")
-            return False
-        return False
-
-    async def join_squad(self, http_client=aiohttp.ClientSession, user={}):
-        try:
-            current_squad_slug = user.get('squad', {}).get('slug', None)
-
-            if settings.ENABLE_AUTO_JOIN_TO_SQUAD and settings.SQUAD_SLUG and current_squad_slug != settings.SQUAD_SLUG:
-                try:
-                    if settings.ENABLE_AUTO_JOIN_TO_SQUAD_CHANNEL and self.already_joined_squad_channel != settings.SQUAD_SLUG:
-                        if not self.tg_client.is_connected:
-                            await self.tg_client.connect()
-                            await asyncio.sleep(delay=random.randint(10, 20))
-
-                        res = await self.tg_client.join_chat(settings.SQUAD_SLUG)
-
-                        if res:
-                            self.success(f"Successfully joined to squad channel: <magenta>{settings.SQUAD_SLUG}</magenta>")
-
-                        self.already_joined_squad_channel = settings.SQUAD_SLUG
-
-                        await asyncio.sleep(delay=random.randint(10, 20))
-
-                        if self.tg_client.is_connected:
-                            await self.tg_client.disconnect()
-
-                except Exception as error:
-                    self.error(f"Unknown error when joining squad channel <cyan>{settings.SQUAD_SLUG}</cyan>: <light-yellow>{error}</light-yellow>")
-
-                squad = settings.SQUAD_SLUG
-                local_headers = deepcopy(headers_notcoin)
-
-                local_headers['X-Auth-Token'] = "Bearer null"
-
-                response = await http_client.post(
-                   'https://api.notcoin.tg/auth/login',
-                    headers=local_headers,
-                    json={"webAppData": self.tg_web_data_not}
-                )
-
-                response.raise_for_status()
-
-                text_data = await response.text()
-
-                json_data = json.loads(text_data)
-
-                accessToken = json_data.get("data", {}).get("accessToken", None)
-
-                if not accessToken:
-                    self.warning(f"Error during join squads: can't get an authentication token to enter to the squad")
-                    return
-
-                local_headers['X-Auth-Token'] = f'Bearer {accessToken}'
-                info_response = await http_client.get(
-                    url=f'https://api.notcoin.tg/squads/by/slug/{squad}',
-                    headers=local_headers
-                )
-
-                info_json = await info_response.json()
-
-                if info_json.get('statusCode') != 200:
-                    self.warning(f"Can't get squad info during joining squad: {info_json.get('Message', f'Something went wrong when joining squad: <magenta>{squad}</magenta>')}")
-                    return None
-
-                chat_id = info_json.get('data', {}).get('squad', {}).get('chatId', None)
-
-                if chat_id == None:
-                    self.warning(f"Can't get chat id during joining squad: <magenta>{squad}</magenta>")
-                    return None
-
-                join_response = await http_client.post(
-                    f'https://api.notcoin.tg/squads/{squad}/join',
-                    headers=local_headers,
-                    json={'chatId': chat_id}
-                )
-
-                if join_response.status in [200, 201]:
-                    self.success(f"Successfully joined squad: <magenta>{squad}</magenta>")
-                else:
-                    self.warning(f"Something went wrong: Can't join to squad <magenta>{squad}</magenta>")
-        except Exception as error:
-            if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                self.warning(f"Warning during joining squad: <magenta>Notpixel</magenta> server is not response.")
-            else:
-                self.error(f"Unknown error during joining squad: <light-yellow>{error}</light-yellow>")
-            await asyncio.sleep(delay=random.randint(5, 10))
-
-    async def handle_templates_list(self, http_client: aiohttp.ClientSession):
-        try:
-            response = await http_client.get('https://notpx.app/api/v1/image/template/list?limit=2000&offset=0')
-
-            templates = await response.json()
-
-            await generate_template_html_page(templates=templates)
         except Exception as e:
-            logger.warning(f"Unknown error during getting templates list: {e}")
+            if 'Gateway Timeout' in str(e):
+                logger.warning(f"{self.session_name} | <yellow>Server is not response.</yellow>")
+            else:
+                logger.error(
+                    f"{self.session_name} | <red>Unknown error while painting: <light-yellow>{e}</light-yellow></red>")
+            await asyncio.sleep(random.randint(2, 5))
+
+    async def get_image(self, session, url, image_headers):
+        image_filename = os.path.join(self.cache, url.split("/")[-1])
+
+        try:
+            if os.path.exists(image_filename):
+                logger.info(f"{self.session_name} | Loading image from cache...")
+                img = Image.open(image_filename)
+                img.load()
+                return img
+        except Exception as e:
+            logger.error(
+                f"{self.session_name} | <red>Failed to load image from file: {image_filename} | Error: {e} <red>")
+
+        try:
+            logger.info(f"{self.session_name} | Downloading image from server...")
+            if "https://fra1.digitaloceanspaces.com/" in url:
+                response = requests.get(url, stream=True)
+                if response.status_code == 200:
+                    with open(image_filename, "wb") as file:
+                        for chunk in response.iter_content(1024):
+                            file.write(chunk)
+
+                img = Image.open(image_filename)
+                img.load()
+                return img
+            else:
+                res = session.get(url, headers=image_headers)
+
+                if res.status_code == 200:
+                    img_data = res.content
+                    img = Image.open(io.BytesIO(img_data))
+
+                    img.save(image_filename)
+                    return img
+                else:
+                    print(res.text)
+                    raise Exception(f"Failed to download image from {url}, status: {res.status_code}")
+        except Exception as e:
+            # traceback.print_exc()
+            logger.error(f"{self.session_name} | Error while loading image from url: {url} | Error: {e}")
             return None
 
-    async def draw_pumpkins(self, http_client: aiohttp.ClientSession):
-        try:
-            status_data = await self.get_status(http_client=http_client)
-
-            if status_data == None:
-                return None
-
-            self.current_user_balance = status_data['userBalance']
-
-            while self.enable_pumpkins:
-                updated_y = random.randint(10, 900)
-                updated_x = random.randint(10, 900)
-
-                pixelId = int(f'{updated_y}{updated_x}')+1
-
-                color = None
-
-                success = await self.send_draw_request(http_client, update=(pixelId, updated_x, updated_y, color), template_id=self.template_id_to_join, special=True)
-
-                self.enable_pumpkins = success
-
-                if success:
-                    await asyncio.sleep(delay=5)
-
-        except Exception as error:
-            if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable") or self.check_error(error, "Internal Server Error"):
-                self.warning(f"Warning during drawing <cyan>[PUMPKINS MODE]</cyan>: <magenta>Notpixel</magenta> server is not response. Retrying..")
-            else:
-                self.warning(f"Something went wrong <cyan>[PUMPKINS MODE]</cyan>: <light-yellow>{error}</light-yellow>")
-            await asyncio.sleep(delay=10)
-
-    async def handle_server_mode(self, http_client: aiohttp.ClientSession, current_balance=0):
-        try:
-            await inform(self.user_id, current_balance, times_to_fall=20, session_name=self.session_name)
-            check = await self.check_join_template(http_client=http_client)
-            if check:
-                await asyncio.sleep(delay=random.randint(4, 10))
-                is_successfully_subscribed = await self.subscribe_to_template(http_client=http_client, template_id=self.template_id_to_join)
-                if is_successfully_subscribed:
-                    self.success(f"<cyan>[{self.mode}]</cyan> Successfully subscribed to the template | ID: <cyan>{self.template_id_to_join}</cyan>")
-                    await asyncio.sleep(delay=random.randint(4, 10))
-                else:
-                    delay = random.randint(60, 120)
-                    self.info(f"Joining to template restart in {delay} seconds. <cyan>[{self.mode}]</cyan>")
-                    await asyncio.sleep(delay=delay)
-                    self.token_live_time = 0
-                    return True
-            await self.draw_server_mode(http_client=http_client, retries=20)
-        except Exception as e:
-            self.error(f"Unknown error during running <cyan>[{self.mode}]</cyan>: {e}")
-            return False
-
-    async def handle_custom_templates_mode(self, http_client: aiohttp.ClientSession):
-        for cycle in [1, 2]:
-            try:
-                self.template_info = {
-                    'x': 244,
-                    'y': 244,
-                    'image_size': 510,
-                    'image': None,
-                    'id': '355876562',
-                }
-
-                if not self.custom_template_id and settings.ENABLE_RANDOM_CUSTOM_TEMPLATE == True and len(settings.RANDOM_TEMPLATE_IDS) > 0:
-                    self.custom_template_id = random.choice(settings.RANDOM_TEMPLATE_IDS)
-                elif not self.custom_template_id and settings.CUSTOM_TEMPLATE_ID:
-                    self.custom_template_id = settings.CUSTOM_TEMPLATE_ID
-
-                if (settings.ENABLE_DRAW_CUSTOM_TEMPLATE == True or settings.ENABLE_RANDOM_CUSTOM_TEMPLATE == True) and self.custom_template_id:
-                    curr_user_template = await self.get_user_current_template(http_client=http_client)
-                    await asyncio.sleep(delay=random.randint(3, 6))
-                    is_successfully_subscribed = True
-                    if not curr_user_template or curr_user_template.get('id', 0) != self.custom_template_id:
-                        is_successfully_subscribed = await self.subscribe_to_template(http_client=http_client, template_id=self.custom_template_id)
-                        if is_successfully_subscribed:
-                            self.success(f"Successfully subscribed to the template | ID: <cyan>{self.custom_template_id}</cyan>")
-                        await asyncio.sleep(delay=random.randint(4, 10))
-
-                    if is_successfully_subscribed:
-                        template_info_data = await self.get_template_info(http_client=http_client, template_id=self.custom_template_id)
-                        if template_info_data:
-                            await asyncio.sleep(delay=random.randint(4, 10))
-                            image_url = template_info_data['url']
-                            image_headers = dict()
-                            image_headers['Host'] = 'static.notpx.app'
-                            template_image = await self.get_image(http_client, image_url, image_headers=image_headers, is_template=True)
-
-                            if template_image:
-                                self.template_info = {
-                                    'x': template_info_data['x'],
-                                    'y': template_info_data['y'],
-                                    'image_size': template_info_data['imageSize'],
-                                    'image': template_image,
-                                    'id': template_info_data['id'],
-                                }
-
-                if self.template_info['image'] == None and cycle < 2:
-                    self.info(f"Use default template <cyan>{self.template_info['id']}</cyan> instead <magenta>{self.custom_template_id}</magenta>")
-                    self.custom_template_id = '355876562'
-                    await asyncio.sleep(delay=random.randint(2, 4))
-                    continue
-
-                if self.template_info['image']:
-                    await self.draw_template(http_client=http_client, template_info=self.template_info)
-                else:
-                    self.warning(f"Something went wrong when try to load template image. Skipping the drawing cycle.")
-                await asyncio.sleep(delay=random.randint(5, 10))
-            except Exception as e:
-                self.error(f"Unknown error during running <cyan>[{self.mode}]</cyan>: {e}")
-                await asyncio.sleep(delay=random.randint(5, 10))
-                return None
-
     async def run(self, proxy: str | None) -> None:
-        if settings.USE_RANDOM_DELAY_IN_RUN and settings.SHOW_TEMPLATES_LIST == False:
-            random_delay = random.randint(settings.RANDOM_DELAY_IN_RUN[0], settings.RANDOM_DELAY_IN_RUN[1])
-            self.info(f"Bot will start in <ly>{random_delay}s</ly>")
-            await asyncio.sleep(random_delay)
-
-        access_token = None
-        refresh_token = None
-        login_need = True
-
+        access_token_created_time = 0
         proxy_conn = ProxyConnector().from_url(proxy) if proxy else None
 
+        headers["User-Agent"] = generate_random_user_agent(device_type='android', browser_type='chrome')
         http_client = CloudflareScraper(headers=headers, connector=proxy_conn)
 
-        if proxy != None:
-            if re.search("http://", proxy):
-                self.image_scraper_proxies = {"http": proxy}
-            elif re.search("https://", proxy):
-                self.image_scraper_proxies = {"http": proxy.replace('https://', 'http://'), "https": proxy}
-            elif re.search("socks5://", proxy):
-                self.image_scraper_proxies = {"http": proxy.replace('socks5://', 'http://'), "socks5": proxy}
-
-        self.image_scraper = cloudscraper.create_scraper()
+        session = cloudscraper.create_scraper()
 
         if proxy:
-            await self.check_proxy(http_client=http_client, proxy=proxy)
+            proxy_check = await self.check_proxy(http_client=http_client, proxy=proxy)
+            if proxy_check:
+                proxy_type = proxy.split(':')[0]
+                proxies = {
+                    proxy_type: proxy
+                }
+                session.proxies.update(proxies)
+                logger.info(f"{self.session_name} | bind with proxy ip: {proxy}")
 
-        self.access_token_created_time = 0
-        self.token_live_time = random.randint(500, 900)
-        tries_to_login = 4
-
-        await self.clean_images_cache()
-
+        token_live_time = randint(1000, 1500)
         while True:
             try:
-                if time() - self.access_token_created_time >= self.token_live_time:
-                    login_need = True
-
-                if login_need:
-                    if "Authorization" in http_client.headers:
-                        del http_client.headers["Authorization"]
-
-                    self.tg_web_data = await self.get_tg_web_data(proxy=proxy)
-                    self.tg_web_data_not = await self.get_tg_web_data_not(proxy=proxy)
-
-                    http_client.headers['Authorization'] = f"initData {self.tg_web_data}"
-
-                    self.access_token_created_time = time()
-                    self.token_live_time = random.randint(500, 900)
-
-                    if self.first_run is not True and self.tg_web_data:
-                        if settings.SHOW_TEMPLATES_LIST == False:
-                            self.success("Logged in successfully")
-                        self.first_run = True
-
-                    login_need = False
-
-                await asyncio.sleep(delay=3)
-
-            except Exception as error:
-                if self.check_timeout_error(error) or self.check_error(error, "Service Unavailable"):
-                    if settings.SHOW_TEMPLATES_LIST == False:
-                        self.warning(f"Warning during login: <magenta>Notpixel</magenta> server is not response.")
-                    if tries_to_login > 0:
-                        tries_to_login = tries_to_login - 1
-                        if settings.SHOW_TEMPLATES_LIST == False:
-                            self.info(f"Login request not always successful, retrying..")
-                        await asyncio.sleep(delay=random.randint(10, 40))
+                if check_base_url() is False:
+                    if settings.ADVANCED_ANTI_DETECTION:
+                        self.can_run = False
+                        logger.warning(
+                            "<yellow>Detected index js file change. Contact me to check if it's safe to continue: https://t.me/airdrophuntersieutoc </yellow>")
                     else:
-                        await asyncio.sleep(delay=5)
-                        break
+                        self.can_run = False
+                        logger.warning(
+                            "<yellow>Detected api change! Stoped the bot for safety. Contact me here to update the bot: https://t.me/airdrophuntersieutoc </yellow>")
                 else:
-                    if settings.SHOW_TEMPLATES_LIST == False:
-                        self.error(f"Unknown error during login: <light-yellow>{error}</light-yellow>")
-                    await asyncio.sleep(delay=5)
-                    break
+                    self.can_run = True
 
-            try:
-                user = await self.get_user_info(http_client=http_client, show_error_message=True)
+                if self.can_run:
+                    if time_module.time() - access_token_created_time >= token_live_time:
+                        tg_web_data = await self.get_tg_web_data(proxy=proxy)
+                        headers['Authorization'] = f"initData {tg_web_data}"
+                        self.balance = 0
+                        access_token_created_time = time_module.time()
+                        token_live_time = randint(1000, 1500)
 
-                await asyncio.sleep(delay=random.randint(2, 5))
+                    local_timezone = get_localzone()
+                    current_time = datetime.now(local_timezone)
+                    start_time = current_time.replace(hour=settings.SLEEP_TIME[0], minute=0, second=0, microsecond=0)
+                    end_time = current_time.replace(hour=settings.SLEEP_TIME[1], minute=0, second=0, microsecond=0)
 
-                if user is not None:
-                    if settings.SHOW_TEMPLATES_LIST == True:
-                        await self.handle_templates_list(http_client=http_client)
-                        await http_client.close()
-                        return None
+                    if end_time < start_time:
+                        end_time += timedelta(days=1)
 
-                    self.mode = 'CUSTOM TEMPLATE MODE'
+                    if settings.NIGHT_MODE and (start_time <= current_time <= end_time):
+                        time_to_sleep = (end_time - current_time).total_seconds()
+                        logger.info(f"{self.session_name} | Sleeping for {time_to_sleep} seconds until {end_time}.")
+                        await asyncio.sleep(time_to_sleep)
 
-                    if settings.ENABLE_SERVER_MODE:
-                        self.mode = 'SERVER MODE'
-                    elif settings.ENABLE_RANDOM_CUSTOM_TEMPLATE:
-                        self.mode = 'RANDOM TEMPLATE MODE'
+                    elif self.login(session):
+                        user = self.get_user_data(session)
 
-                    self.user = user
-                    current_balance = await self.get_balance(http_client=http_client)
-                    repaints = user['repaints']
-                    league = user['league']
+                        if user:
+                            self.maxtime = user['maxMiningTime']
+                            self.fromstart = user['fromStart']
+                            self.balance = int(user['userBalance'])
+                            self.user_upgrades = user['boosts']
+                            repaints = int(user['repaintsTotal'])
+                            user_league = user['league']
+                            logger.info(
+                                f"{self.session_name} | Pixel Balance: <light-blue>{int(user['userBalance'])}</light-blue> | Pixel available to paint: <cyan>{user['charges']}</cyan> | User league: <yellow>{user_league}</yellow>")
 
-                    if current_balance is None:
-                        self.info(f"Current balance: Unknown")
-                    else:
-                        self.info(f"Balance: <light-green>{'{:,.3f}'.format(current_balance)}</light-green> | Repaints: <magenta>{repaints}</magenta> | League: <cyan>{league.capitalize()}</cyan>")
+                            if user['charges'] > 0:
+                                if settings.USE_RANDOM_TEMPLATES:
+                                    self.template_id = random.choice(settings.RANDOM_TEMPLATES_ID)
+                                elif settings.USE_CUSTOM_TEMPLATE:
+                                    self.template_id = settings.CUSTOM_TEMPLATE_ID
 
-                    if settings.ENABLE_AUTO_JOIN_TO_SQUAD:
-                        await self.join_squad(http_client=http_client, user=user)
-                        await asyncio.sleep(delay=random.randint(2, 5))
+                                if settings.USE_NEW_PAINT_METHOD:
+                                    logger.info(f"{self.session_name} | Using the new painting method.")
+                                    reachable()
+                                    inform(self.user_id, self.balance)
+                                    await self.paint(session)
+                                else:
 
-                    if settings.ENABLE_AUTO_DRAW == True:
-                        if settings.ENABLE_SERVER_MODE == True:
-                            need_to_skip_cycle = await self.handle_server_mode(http_client=http_client, current_balance=current_balance)
-                            if need_to_skip_cycle == True:
-                                continue
+                                    curr_template = await self.get_template(session)
+
+                                    await asyncio.sleep(randint(2, 5))
+                                    subcribed = True
+                                    if not curr_template or curr_template.get('id', 0) != self.template_id:
+                                        subcribed = await self.subscribe_template(session, self.template_id)
+                                        if subcribed:
+                                            logger.success(
+                                                f"{self.session_name} | <green>Successfully subscribed to the template | ID: <cyan>{self.template_id}</cyan></green>")
+                                        await asyncio.sleep(random.randint(2, 5))
+
+                                    if subcribed:
+                                        template_info = await self.get_template_info(session)
+                                        # print(template_info)
+                                        if template_info:
+                                            url = template_info['url']
+                                            img_headers = dict()
+                                            img_headers['Host'] = 'static.notpx.app'
+                                            template_image = await self.get_image(session, url,
+                                                                                  image_headers=img_headers)
+                                            self.default_template = {
+                                                'x': template_info['x'],
+                                                'y': template_info['y'],
+                                                'image_size': template_info['imageSize'],
+                                                'image': template_image,
+                                            }
+                                    if not self.default_template['image']:
+                                        image_url = 'https://app.notpx.app/assets/halloween-DrqzeAH-.png'
+                                        image_headers = headers.copy()
+                                        image_headers['Referer'] = 'https://app.notpx.app/'
+                                        self.default_template['image'] = await self.get_image(session, image_url,
+                                                                                              image_headers=image_headers)
+                                        await asyncio.sleep(random.randint(2, 5))
+
+                                    logger.info(f"{self.session_name} | Using the old painting method.")
+                                    await self.repaintV5(session, template_info=self.default_template)
+
+                                    await asyncio.sleep(random.randint(2, 5))
+
+                            r = random.uniform(2, 4)
+                            if float(self.fromstart) >= self.maxtime / r:
+                                self.claimpx(session)
+                                await asyncio.sleep(random.uniform(2, 5))
+                            if settings.AUTO_TASK:
+                                res = session.get(f"{API_GAME_ENDPOINT}/mining/task/check/x?name=notpixel",
+                                                  headers=headers)
+                                if res.status_code == 200 and res.json()['x:notpixel'] and self.checked[1] is False:
+                                    self.checked[1] = True
+                                    logger.success("<green>Task Not pixel on x completed!</green>")
+                                res = session.get(f"{API_GAME_ENDPOINT}/mining/task/check/x?name=notcoin",
+                                                  headers=headers)
+                                if res.status_code == 200 and res.json()['x:notcoin'] and self.checked[2] is False:
+                                    self.checked[2] = True
+                                    logger.success("<green>Task Not coin on x completed!</green>")
+                                res = session.get(f"{API_GAME_ENDPOINT}/mining/task/check/paint20pixels",
+                                                  headers=headers)
+                                if res.status_code == 200 and res.json()['paint20pixels'] and self.checked[3] is False:
+                                    self.checked[3] = True
+                                    logger.success("<green>Task paint 20 pixels completed!</green>")
+
+                                if repaints >= 2049:
+                                    res = session.get(f"{API_GAME_ENDPOINT}/mining/task/check/leagueBonusPlatinum",
+                                                      headers=headers)
+                                    if res.status_code == 200 and res.json()['leagueBonusPlatinum'] and self.checked[
+                                        8] is False:
+                                        self.checked[8] = True
+                                        logger.success(
+                                            f"{self.session_name} | <green>Upgraded to Plantium league!</green>")
+                                if repaints >= 129:
+                                    res = session.get(f"{API_GAME_ENDPOINT}/mining/task/check/leagueBonusGold",
+                                                      headers=headers)
+                                    if res.status_code == 200 and res.json()['leagueBonusGold'] and self.checked[
+                                        7] is False:
+                                        self.checked[7] = True
+                                        logger.success(f"{self.session_name} | <green>Upgraded to Gold league!</green>")
+                                if repaints >= 9:
+                                    res = session.get(f"{API_GAME_ENDPOINT}/mining/task/check/leagueBonusSilver",
+                                                      headers=headers)
+                                    if res.status_code == 200 and res.json()['leagueBonusSilver'] and self.checked[
+                                        6] is False:
+                                        self.checked[6] = True
+                                        logger.success(
+                                            f"{self.session_name} | <green>Upgraded to Silver league!</green>")
+
+                                res = session.get(f"{API_GAME_ENDPOINT}/mining/task/check/leagueBonusBronze",
+                                                  headers=headers)
+                                if res.status_code == 200 and res.json()['leagueBonusBronze'] and self.checked[
+                                    5] is False:
+                                    self.checked[5] = True
+                                    logger.success(f"{self.session_name} | <green>Upgraded to Bronze league!</green>")
+
+                            if settings.AUTO_UPGRADE_PAINT_REWARD:
+                                if self.is_max_lvl['paintReward'] is False:
+                                    await self.auto_upgrade_paint(session)
+                            if settings.AUTO_UPGRADE_RECHARGE_SPEED:
+                                if self.is_max_lvl['reChargeSpeed'] is False:
+                                    await self.auto_upgrade_recharge_speed(session)
+                            if settings.AUTO_UPGRADE_RECHARGE_ENERGY:
+                                if self.is_max_lvl['energyLimit'] is False:
+                                    await self.auto_upgrade_energy_limit(session)
+
                         else:
-                            await self.handle_custom_templates_mode(http_client=http_client)
+                            logger.warning(f"{self.session_name} | <yellow>Failed to get user data!</yellow>")
 
-                    if settings.ENABLE_AUTO_UPGRADE == True:
-                        await self.upgrade(http_client=http_client)
-                        await asyncio.sleep(delay=random.randint(2, 5))
-
-                    if settings.ENABLE_CLAIM_REWARD == True:
-                        reward = await self.claim_mine(http_client=http_client)
-                        if reward is not None and reward != 0:
-                            self.info(f"Claim reward: <light-green>{'{:,.3f}'.format(reward)}</light-green>")
-                        await asyncio.sleep(delay=random.randint(2, 5))
-
-                    if settings.ENABLE_AUTO_TASKS == True:
-                        await self.run_tasks(http_client=http_client)
-                        await asyncio.sleep(delay=random.randint(2, 5))
-
-                    if settings.ENABLE_AUTO_PUMPKINS == True:
-                        await self.draw_pumpkins(http_client=http_client)
-                        await asyncio.sleep(delay=random.randint(2, 5))
-
-                sleep_time = random.randint(int(settings.SLEEP_TIME_IN_MINUTES[0]), int(settings.SLEEP_TIME_IN_MINUTES[1]))
-                is_night = False
-
-                if settings.DISABLE_IN_NIGHT:
-                    is_night = self.is_night_time()
-
-                if is_night:
-                    sleep_time = self.time_until_morning()
-
-                if is_night:
-                    self.info(f"sleep {int(sleep_time)} minutes to the morning (to {int(settings.NIGHT_TIME[1])} am hours) 💤")
+                if self.multi_thread:
+                    sleep_ = randint(settings.SLEEP_TIME_BETWEEN_EACH_ROUND[0],
+                                     settings.SLEEP_TIME_BETWEEN_EACH_ROUND[1])
+                    logger.info(f"{self.session_name} | Sleep {sleep_}s...")
+                    await asyncio.sleep(sleep_)
                 else:
-                    self.info(f"sleep {int(sleep_time)} minutes between cycles 💤")
-
-                if self.socket != None:
-                    try:
-                        await self.socket.close()
-                    except Exception as error:
-                        self.warning(f"Unknown error during closing socket: <light-yellow>{error}</light-yellow>")
-
-                await asyncio.sleep(delay=sleep_time*60)
+                    await http_client.close()
+                    session.close()
+                    break
+            except InvalidSession as error:
+                raise error
 
             except Exception as error:
-                self.error(f"Unknown error: <light-yellow>{error}</light-yellow>")
-                await asyncio.sleep(delay=random.randint(5, 10))
+                traceback.print_exc()
+                logger.error(f"{self.session_name} | Unknown error: {error}")
+                await asyncio.sleep(delay=randint(60, 120))
+
 
 async def run_tapper(tg_client: Client, proxy: str | None):
     try:
-        await Tapper(tg_client=tg_client).run(proxy=proxy)
+        sleep_ = randint(settings.DELAY_START_BOT[0], settings.DELAY_START_BOT[1])
+        logger.info(f"{tg_client.name} | start after {sleep_}s")
+        await asyncio.sleep(sleep_)
+        await Tapper(tg_client=tg_client, multi_thread=True).run(proxy=proxy)
     except InvalidSession:
-        self.error(f"{tg_client.name} | Invalid Session")
+        logger.error(f"{tg_client.name} | Invalid Session")
+
+
+async def run_tapper1(tg_clients: list[Client], proxies):
+    proxies_cycle = cycle(proxies) if proxies else None
+    while True:
+        for tg_client in tg_clients:
+            try:
+                await Tapper(tg_client=tg_client, multi_thread=False).run(
+                    next(proxies_cycle) if proxies_cycle else None)
+            except InvalidSession:
+                logger.error(f"{tg_client.name} | Invalid Session")
+
+            sleep_ = randint(settings.DELAY_EACH_ACCOUNT[0], settings.DELAY_EACH_ACCOUNT[1])
+            logger.info(f"Sleep {sleep_}s...")
+            await asyncio.sleep(sleep_)
+
+        sleep_ = randint(settings.SLEEP_TIME_BETWEEN_EACH_ROUND[0], settings.SLEEP_TIME_BETWEEN_EACH_ROUND[1])
+        logger.info(f"<red>Sleep {sleep_}s...</red>")
+        await asyncio.sleep(sleep_)
